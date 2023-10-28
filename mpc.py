@@ -14,52 +14,70 @@ def callback_leader(data):
 def callback_follower(data):
     global state_follower
     state_follower = np.array([data.pose.pose.position.x, data.pose.pose.position.y, data.twist.twist.linear.x, data.twist.twist.angular.z])
+def get_desired_position(self, state_leader, distance_behind):
+        desired_x = state_leader[0] - distance_behind * np.cos(state_leader[2]) 
+        desired_y = state_leader[1] - distance_behind * np.sin(state_leader[2])
+        return np.array([desired_x, desired_y])
 
-def cost_function(u, *args):
-    state_follower, state_leader, T = args
-    N = len(u) // 2
-    x = state_follower.copy()
-    cost = 0
+
+def cost_function(self, u, *args):
+        state_follower, state_leader, T, distance_behind = args
+        N = len(u) // 2
+        x = state_follower.copy()
+        cost = 0
+
+        position_weight = 7.0
+        orientation_weight = 1.0
+        control_weight = 0.4
+
+        for k in range(N):
+            control = u[2 * k:2 * k + 2]
+            theta = x[2]
+            x[0] += control[0] * np.cos(theta) * T
+            x[1] += control[0] * np.sin(theta) * T
+            x[2] += control[1] * T
+            x[2] = np.arctan2(np.sin(x[2]), np.cos(x[2]))
+
+            desired_position = self.get_desired_position(state_leader, distance_behind)
+            position_diff = np.linalg.norm(x[:2] - desired_position)
+            orientation_diff = x[2] - state_leader[2]
+
+            orientation_error = np.arctan2(np.sin(orientation_diff), np.cos(orientation_diff))
+
+            control_effort = np.sum(np.square(control))
+
+            cost += position_weight * np.square(position_diff)
+            cost += orientation_weight * np.square(orientation_error)
+            cost += control_weight * control_effort
+
+        return cost
+
     
-    for k in range(N):
-        state_diff = x - state_leader
-        cost += np.sum(state_diff**2) + np.sum(u[k*2:k*2+2]**2)
 
-        cos_theta = np.cos(x[2])
-        sin_theta = np.sin(x[2])
-        u_k = u[k*2:k*2+2]
-        x_next = x + np.array([T * cos_theta * u_k[0], T * sin_theta * u_k[0], 0, T * u_k[1]])
-        x = x_next.copy()
-    
-    return cost
+def calculate_mpc_control_input(self):
+        T = 0.2
+        N = 20
+        u_dim = 2
+        v_max = 0.4
+        omega_max = np.pi
+        distance_behind = 1
+
+        u0 = np.zeros(N * u_dim)
+
+        bounds = [(0, v_max) if i % u_dim == 0 else (-omega_max, omega_max) for i in range(N * u_dim)]
+
+        args = (self.state_follower, self.state_leader, T, distance_behind)
+
+        result = minimize(self.cost_function, u0, args=args, method='SLSQP', bounds=bounds)
+
+        if result.success:
+            return result.x[:u_dim]
+        else:
+            rospy.logwarn("MPC optimization failed.")
+            return None
 
 
-def calculate_mpc_control_input(state_leader, state_follower):
-    T = 0.1  # Sample time
-    N = 10  # Prediction horizon
-    v_max = 0.5  # Maximum linear velocity
-    omega_max = 0.5  # Maximum angular velocity
 
-    u0 = np.zeros(2 * N)
-
-    # Define bounds for linear velocity allowing both positive and negative values
-    bounds_v = [(0, v_max)] * N
-
-    # Define bounds for angular velocity within the range of -π to π
-    bounds_omega = [(-np.pi, np.pi)] * N
-
-    # Combine bounds for both linear and angular velocities
-    bounds = bounds_v + bounds_omega
-
-    args = (state_follower, state_leader, T)
-    result = minimize(cost_function, u0, args=args, bounds=bounds)
-
-    if result.success:
-        u_optimal = result.x  # Extract the optimal control inputs
-        return u_optimal
-    else:
-        rospy.logwarn("MPC problem is infeasible. No solution found.")
-        return None
 
 
 def mpc_controller():
