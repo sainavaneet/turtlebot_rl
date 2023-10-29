@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from scipy.optimize import minimize
+from std_srvs.srv import Empty
+import os
+import atexit
 
 class AdvancedNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -37,6 +40,9 @@ class TurtlebotController:
         rospy.Subscriber('/robot2/odom', Odometry, self.callback_follower)
         rospy.Subscriber('/robot1/odom', Odometry, self.callback_leader)
         rospy.Subscriber('/robot2/scan', LaserScan, self.scan_callback)
+        self.reset_proxy = rospy.ServiceProxy('gazebo/reset_simulation', Empty)
+        self.unpause_proxy = rospy.ServiceProxy('gazebo/unpause_physics', Empty)
+        self.pause_proxy = rospy.ServiceProxy('gazebo/pause_physics', Empty)
 
         self.n_actions = 2  
         self.n_states = 1  
@@ -45,7 +51,10 @@ class TurtlebotController:
         self.policy_net = AdvancedNN(self.n_states, hidden_size, self.n_actions)
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)  
         self.criterion = nn.MSELoss()
+        self.episode_count = 0  # Counts completed episodes
+        self.save_interval = 10  # Save every 10 episodes
         self.rate = rospy.Rate(10)  
+        self.model_save_path = "/home/navaneet/rl_ws/src/turtlebot_controller/rl_mpc/saved/model.pt" 
 
     def scan_callback(self, msg):
         self.obstacle_distance = min(msg.ranges) 
@@ -130,9 +139,9 @@ class TurtlebotController:
         T = 0.2
         N = 20
         u_dim = 2
-        v_max = 0.4
+        v_max = 0.5
         omega_max = np.pi
-        distance_behind = 1
+        distance_behind = 1.5
 
         u0 = np.zeros(N * u_dim)
 
@@ -149,20 +158,75 @@ class TurtlebotController:
             return None
 
     def convert_rl_action_to_velocity(self, action):
+        linear_velocity = 0.0
+        angular_velocity = 0.0
         if action == 0:
-            linear_velocity = 0.2
-            angular_velocity = -0.5
+            linear_velocity = 0.2    
         elif action == 1:
+            linear_velocity = 0.1
+            angular_velocity = 0.8
+        elif action == 2:
             linear_velocity = 0.2
-            angular_velocity = 0.5
+            angular_velocity = 0.8
+        elif action == 3:
+            linear_velocity = 0.1
+            angular_velocity = 0.9
+        elif action == 4:
+            linear_velocity = 0.1
+            angular_velocity = -0.9
+        elif action == 5:
+            linear_velocity = -0.2
+        elif action == 6:
+            pass 
 
         return linear_velocity, angular_velocity
+    
+    def save_model(self, path):
+        torch.save(self.policy_net.state_dict(), path)
+        print(f"Model saved at {path} after episode {self.episode_count}")
+            
+    def load_model(self, path):
+    
+        if os.path.exists(path):
+            self.policy_net.load_state_dict(torch.load(path))
+            self.policy_net.eval()  
+            print(f"Model loaded from {path}")
+        else:
+            print("No model found at specified path.")
+
+    
+    def reset(self):
+        rospy.wait_for_service('gazebo/reset_simulation')
+        try:
+            self.reset_proxy()
+            self.unpause_proxy()
+            rospy.sleep(2)  
+
+        except rospy.ServiceException as e:
+            rospy.logerr("An error occurred while trying to reset the simulation: %s", e)
+
+            
 
     def run(self):
         while not rospy.is_shutdown():
-            if self.obstacle_distance < 0.5:  
+            log_info_details = {}
+
+            log_info_details['ObstacleDist'] = f"{self.obstacle_distance:.2f}"
+
+            if self.obstacle_distance <= 0.13:
+                log_info_details['Status'] = "RESET"
+                self.episode_count += 1  
+
+                if self.episode_count % self.save_interval == 10:
+                    self.save_model(self.model_save_path)
+
+                self.reset()
+                continue
+
+            elif self.obstacle_distance < 0.3:
                 current_state = self.obstacle_distance
                 action = self.select_action(current_state)
+
                 linear_velocity, angular_velocity = self.convert_rl_action_to_velocity(action)
 
                 twist = Twist()
@@ -170,18 +234,38 @@ class TurtlebotController:
                 twist.angular.z = angular_velocity
                 self.pub_follower.publish(twist)
 
-            else:  
-                optimal = self.calculate_mpc_control_input()
-                twist = Twist()
-                twist.linear.x = optimal[0]
-                twist.angular.z = optimal[1]
-                self.pub_follower.publish(twist)
+                log_info_details['Mode'] = "RL"
+                log_info_details['Action'] = f"{action}"
+                log_info_details['LinearVel'] = f"{linear_velocity:.2f}"
+                log_info_details['AngularVel'] = f"{angular_velocity:.2f}"
 
-            self.rate.sleep()
+            else:
+                if self.state_follower is None or self.state_leader is None:
+                    rospy.logwarn("State not initialized. Skipping iteration.")
+                    continue
+
+                optimal = self.calculate_mpc_control_input()
+                if optimal is not None:
+                    twist = Twist()
+                    twist.linear.x = optimal[0]
+                    twist.angular.z = optimal[1]
+                    self.pub_follower.publish(twist)
+
+                    # Add MPC details to the log info.
+                    log_info_details['Mode'] = "MPC"
+                    log_info_details['LinearVel'] = f"{twist.linear.x:.2f}"
+                    log_info_details['AngularVel'] = f"{twist.angular.z:.2f}"
+                else:
+                    rospy.logwarn("MPC calculation failed.")
+
+            rospy.loginfo('; '.join([f"{k}: {v}" for k, v in log_info_details.items()]))
+
+            self.rate.sleep()  # This line should be within the loop.
 
 if __name__ == '__main__':
     try:
         controller = TurtlebotController()
+        atexit.register(controller.save_model, controller.model_save_path)
         controller.run()
     except rospy.ROSInterruptException:
         pass
